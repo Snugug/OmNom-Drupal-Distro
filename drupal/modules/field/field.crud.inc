@@ -15,8 +15,6 @@
  *
  * The Field CRUD API uses
  * @link field Field API data structures @endlink.
- *
- * @see field
  */
 
 /**
@@ -44,11 +42,10 @@
  *       system variable.
  *     - settings: each omitted setting is given the default value specified in
  *       hook_field_storage_info().
- *
  * @return
  *   The $field array with the id property filled in.
- *
- * @throws FieldException
+ * @throw
+ *   FieldException
  *
  * See: @link field Field API data structures @endlink.
  */
@@ -445,8 +442,8 @@ function field_delete_field($field_name) {
  *
  * @return
  *   The $instance array with the id property filled in.
- *
- * @throws FieldException
+ * @throw
+ *   FieldException
  *
  * See: @link field Field API data structures @endlink.
  */
@@ -513,7 +510,8 @@ function field_create_instance($instance) {
  *   properties specified in $instance overwrite the existing values for
  *   the instance.
  *
- * @throws FieldException
+ * @throw
+ *   FieldException
  *
  * @see field_create_instance()
  */
@@ -826,8 +824,6 @@ function field_delete_instance($instance, $field_cleanup = TRUE) {
  *     ),
  *   );
  * @endcode
- *
- * @see field
  */
 
 /**
