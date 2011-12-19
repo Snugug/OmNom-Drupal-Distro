@@ -1,0 +1,314 @@
+<?php
+
+/**
+ * @file
+ * Adds token and pattern substitutions for the SASSY SASS / SCSS compiler.
+ */
+
+/**
+ * Implementation of hook_sassy_alter().
+ */
+function sassy_substitutions_sassy_alter(&$data, $info) {
+  if ($info['iteration'] == SASSY_PRECOMPILE) {
+    $data = sassy_substitutions_tokens_replace($data);
+    $data = sassy_substitutions_patterns_replace($data, SASSY_PRECOMPILE);
+  }
+  else if ($info['iteration'] == SASSY_POSTCOMPILE) {
+    $data = sassy_substitutions_patterns_replace($data, SASSY_POSTCOMPILE);
+  }
+}
+
+/**
+ * Implementation of hook_sassy_substitutions_token_info().
+ *
+ * Loads the theme settings form of a theme and extracts the theme settings
+ * that are marked as SASS Tokens.
+ */
+function sassy_substitutions_sassy_substitutions_token_info() {
+  module_load_include('inc', 'system', 'system.admin');
+  // Load the theme settings form so we can extract all theme settings that
+  // are flagged as SASS tokens.
+  $elements = drupal_get_form('system_theme_settings', $GLOBALS['theme_key']);
+  $tokens = sassy_substitutions_tokens_extract($elements, $GLOBALS['theme_key']);
+  foreach ($tokens as $key => $label) {
+    $info[$key] = array(
+      'label' => $label,
+      'description' => t('A theme settings token.'),
+      'token' => str_replace('_', '-', $key),
+      'callback' => 'sassy_substitutions_theme_setting',
+    );
+  }
+  return $info;
+}
+
+/**
+ * Token callback for theme setting tokens.
+ *
+ * @param $info
+ *   The token info as an array.
+ * @param $match
+ *   Information about the matched string in the SCSS as returned by
+ *   sassy_substitutions_tokens_find().
+ *
+ * @return
+ *   The stored theme setting value for this theme setting token.
+ */
+function sassy_substitutions_theme_setting($info, $match) {
+  return theme_get_setting($info['key']);
+}
+
+/**
+ * Picks all form elements that are marked as SASS tokens from a form.
+ *
+ * @param $elements
+ *   A FAPI array render array.
+ * @param $values
+ *   The submitted form values as an array.
+ *
+ * @return
+ *   All form elements that are marked as tokens in an array, keyed by the
+ *   form element's key.
+ */
+function sassy_substitutions_tokens_extract($elements, $theme) {
+  $tokens = array();
+  foreach (element_children($elements) as $key) {
+    if (!empty($elements[$key]['#sassy'])) {
+      $tokens[$key] = !empty($elements[$key]['#title']) ? $elements[$key]['#title'] : '';
+    }
+    $tokens = array_merge($tokens, sassy_substitutions_tokens_extract($elements[$key], $theme));
+  }
+  return $tokens;
+}
+
+/**
+ * Applies all available modifiers to a SCSS string.
+ *
+ * @param $data
+ *   A SCSS string.
+ *
+ * @return
+ *   The processed SCSS string.
+ */
+function sassy_substitutions_tokens_replace($data) {
+  if ($tokens = sassy_substitutions_tokens_find($data)) {
+    $cache = &drupal_static(__FUNCTION__);
+    $keys = array_keys($tokens);
+    foreach (sassy_substitutions_tokens_fetch() as $name => $info) {
+      if (!empty($info['token'])) {
+        foreach (preg_grep('/' . $info['token'] . '/i', $keys) as $grep) {
+          if (!empty($tokens[$grep])) {
+            foreach ($tokens[$grep] as $match) {
+              // Info contains the substitution definition.
+              // Match contains the current match as (match, default, token).
+              $result = $info['string'];
+              if (empty($info['string']) && !empty($info['callback']) && function_exists($info['callback'])) {
+                if (!empty($info['cache'])) {
+                  $hash = drupal_hash_base64(serialize($info) . ':' . serialize($match));
+                  $result = $cache[$hash] = isset($cache[$hash]) ? $cache[$hash] : call_user_func_array($info['callback'], array_merge(array($info, $match), $match['arguments']));
+                }
+                else {
+                  $result = call_user_func_array($info['callback'], array_merge(array($info, $match), $match['arguments']));
+                }
+              }
+              // Replacing in this style so that multiple tokens can have different defaults
+              $data = str_replace($match['match'], ($result === NULL ? $match['default'] : $result), $data);
+            }
+            // We are done with this token, remove it from the array.
+            unset($tokens[$grep]);
+          }
+        }
+      }
+      if (empty($tokens)) {
+        break;
+      }
+    }
+  }
+  return $data;
+}
+
+/**
+ * Populates a token implementation with default values.
+ *
+ * @param $item
+ *   An array defining a token.
+ *
+ * @return
+ *   The token array, populated with defaults.
+ */
+function sassy_substitutions_tokens_defaults($item) {
+  $item = $item + array(
+    'label' => '',
+    'description' => '',
+    'token' => '',
+    'string' => NULL,
+    'callback' => NULL,
+    'preprocess' => TRUE,
+    'cache' => TRUE,
+  );
+  $item['token'] = $item['preprocess'] ? preg_quote($item['token']) : $item['token'];
+  return $item;
+}
+
+/**
+ * Collects information about possible replacement strings or callbacks. Those
+ * can be provided by modules and themes and will be executed before the SASS
+ * parser.
+ *
+ * @return
+ *   A list of all defined SASS modifiers as an array.
+ */
+function sassy_substitutions_tokens_fetch() {
+  $tokens = &drupal_static(__FUNCTION__);
+  if (!isset($tokens)) {
+    $tokens = array();
+    if ($cache = cache_get('sassy_substitutions_tokens:' . $GLOBALS['theme_key'])) {
+      $tokens = $cache->data;
+    }
+    else {
+      foreach (module_implements('sassy_substitutions_token_info') as $module) {
+        foreach (module_invoke($module, 'sassy_substitutions_token_info') as $key => $item) {
+          $item['key'] = $key;
+          $item['module'] = $module;
+          $tokens[$key] = sassy_substitutions_tokens_defaults($item);
+        }
+      }
+      foreach (array_merge($GLOBALS['base_theme_info'], array($GLOBALS['theme_info'])) as $info) {
+        $function = $info->info['name'] . '_sassy_substitutions_token_info';
+        if (function_exists($function) && $data = $function()) {
+          foreach ($data as $key => $item) {
+            $item['key'] = $key;
+            $item['theme'] = $info->info['name'];
+            $tokens[$key] = sassy_substitutions_tokens_defaults($item);
+          }
+        }
+      }
+      // This removes any tokens that have not been replaced, replacing them with their defaults.
+      $tokens['cleanup'] = sassy_substitutions_tokens_defaults(array(
+        'key' => 'cleanup',
+        'module' => 'sassy_substitutions',
+        'preprocess' => FALSE,
+        'token' => '.+',
+      ));
+      drupal_alter('sassy_substitutions_token_info', $tokens);
+      cache_set('sassy_substitutions_tokens:' . $GLOBALS['theme_key'], $tokens);
+    }
+  }
+  return $tokens;
+}
+
+/**
+ * Looks for SCSS replacement tokens in $data and saves the matches in an array.
+ *
+ * @param $data
+ *   A SCSS string.
+ *
+ * @return
+ *   An array of replacement tokens.
+ */
+function sassy_substitutions_tokens_find($data) {
+  $tokens = array();
+  if (preg_match_all('/\@token\([\'"]?([^\)\'"]+?)[\'"]?(,\s*[\'"]?([^\)\'"]+)[\'"]?)*\)/', $data, $matches)) {
+    foreach ($matches[0] as $i => $string) {
+      $arguments = array_map('trim', explode(',', $matches[3][$i]));
+      $default = array_shift($arguments);
+      $tokens[$matches[1][$i]][] = array(
+        'token' => $matches[1][$i],
+        'default' => isset($default) ? $default : '',
+        'arguments' => $arguments,
+        'match' => $string,
+      );
+    }
+  }
+  return $tokens;
+}
+
+/**
+ * Applies all available modifiers to a SCSS string.
+ *
+ * @param $data
+ *   A SCSS string.
+ *
+ * @return
+ *   The processed SCSS string.
+ */
+function sassy_substitutions_patterns_replace($data, $iteration) {
+  foreach (sassy_substitutions_patterns_fetch() as $pattern) {
+    if (!empty($pattern['pattern']) && !empty($pattern['iteration']) && $pattern['iteration'] == $iteration) {
+      if (!empty($pattern['string'])) {
+        $data = preg_replace('/' . $pattern['pattern'] . '/', $pattern['string'], $data);
+      }
+      else if (!empty($pattern['callback']) && function_exists($pattern['callback'])) {
+        preg_match_all('/' . $pattern['pattern'] . '/', $data, $matches);
+        foreach (array_unique($matches[0]) as $i => $match) {
+          $additional = array();
+          for ($j = 1; $j < count($matches); $j++) {
+            $additional[] = $matches[$j][$i];
+          }
+          $data = str_replace($match, $pattern['callback']($match, $additional, $pattern), $data);
+        }
+      }
+    }
+  }
+  return $data;
+}
+
+/**
+ * Populates a pattern implementation with default values.
+ *
+ * @param $item
+ *   An array defining a pattern.
+ *
+ * @return
+ *   The pattern array, populated with defaults.
+ */
+function sassy_substitutions_patterns_defaults($item) {
+  $item = $item + array(
+    'iteration' => SASSY_PRECOMPILE,
+    'label' => '',
+    'description' => '',
+    'pattern' => '',
+    'callback' => NULL,
+    'string' => NULL,
+  );
+  return $item;
+}
+
+/**
+ * Collects information about possible replacement strings or callbacks. Those
+ * can be provided by modules and themes and will be executed before the SASS
+ * parser.
+ *
+ * @return
+ *   A list of all defined SASS modifiers as an array.
+ */
+function sassy_substitutions_patterns_fetch() {
+  $patterns = &drupal_static(__FUNCTION__);
+  if (!isset($patterns)) {
+    $patterns = array();
+    if ($cache = cache_get('sassy_substitutions_patterns:' . $GLOBALS['theme_key'])) {
+      $patterns = $cache->data;
+    }
+    else {
+      foreach (module_implements('sassy_substitutions_pattern_info') as $module) {
+        foreach (module_invoke($module, 'sassy_substitutions_pattern_info') as $key => $item) {
+          $item['key'] = $key;
+          $item['module'] = $module;
+          $patterns[$key] = sassy_substitutions_patterns_defaults($item);
+        }
+      }
+      foreach (array_merge($GLOBALS['base_theme_info'], array($GLOBALS['theme_info'])) as $info) {
+        $function = $info->info['name'] . '_sassy_substitutions_pattern_info';
+        if (function_exists($function) && $data = $function()) {
+          foreach ($data as $key => $item) {
+            $item['key'] = $key;
+            $item['theme'] = $info->info['name'];
+            $patterns[$key] = sassy_substitutions_patterns_defaults($item);
+          }
+        }
+      }
+      drupal_alter('sassy_substitutions_pattern_info', $patterns);
+      cache_set('sassy_substitutions_patterns:' . $GLOBALS['theme_key'], $patterns);
+    }
+  }
+  return $patterns;
+}

@@ -1,0 +1,259 @@
+<?php
+
+/**
+ * @file
+ * Handles compiling of .sass / .scss files.
+ */
+
+/**
+ * Flag for alter hooks that are executed before the SASS parser.
+ */
+define('SASSY_PRECOMPILE', 'SASSY_PRECOMPILE');
+
+/**
+ * Flag for alter hooks that are executed after the SASS parser.
+ */
+define('SASSY_POSTCOMPILE', 'SASSY_POSTCOMPILE');
+
+/**
+ * Implementation of hook_flush_caches().
+ */
+function sassy_flush_caches() {
+  sassy_clear_cache();
+}
+
+/**
+ * Implementation of hook_menu().
+ */
+function sassy_menu() {
+  return array(
+    'admin/config/media/sassy' => array(
+      'title' => 'Sassy',
+      'description' => 'Configure the Sassy SASS/SCSS compiler',
+      'page callback' => 'drupal_get_form',
+      'page arguments' => array('sassy_admin_form'),
+      'access arguments' => array('administer site configuration'),
+      'file' => 'sassy.admin.inc',
+    ),
+  );
+}
+
+/**
+ * Implementation of hook_element_info_alter().
+ */
+function sassy_element_info_alter(&$type) {
+  array_unshift($type['styles']['#pre_render'], 'sassy_pre_render');
+  if (variable_get('sassy_devel', FALSE) && user_access('administer site configuration') && flood_is_allowed('sassy_devel_warning', 1)) {
+    flood_register_event('sassy_devel_warning');
+    drupal_set_message(t('Your SASS / SCSS files are being recompiled on every page request. Don\'t forget to <a href="!link">disable this feature</a> before opening your website to the public.', array('!link' => url('admin/config/development/performance'))), 'warning');
+  }
+}
+
+
+
+/**
+ * Builds the SASS cache. Should only be invoked by drupal_render().
+ *
+ * @param $elements
+ *   A render array containing:
+ *   '#items': The CSS items as returned by drupal_add_css() and altered by
+ *   drupal_get_css().
+ *   '#group_callback': A function to call to group #items to enable the use of
+ *   fewer tags by aggregating files and/or using multiple @import statements
+ *   within a single tag.
+ *   '#aggregate_callback': A function to call to aggregate the items within the
+ *   groups arranged by the #group_callback function.
+ *
+ * @return $elements
+ *   The modified (pre-rendered) $elements parameter.
+ */
+function sassy_pre_render($elements) {
+  $map = $original = variable_get('sassy_cache', array());
+  $devel = variable_get('sassy_debug', FALSE);
+  $style = variable_get('sassy_style', 'nested');
+  foreach ($elements['#items'] as $key => $file) {
+    if ($file['type'] == 'file' && in_array(drupal_substr($file['data'], -5), array('.scss', '.sass'))) {
+      // If the file is set to recompile on every page load then we don't want
+      // it to be aggregated.
+      $file['recompile'] = isset($file['recompile']) ? $file['recompile'] : FALSE;
+      $file['preprocess'] = !empty($file['recompile']) ? FALSE : $file['preprocess'];
+      // Create a unique identifier for the file.
+      if ($file['recompile'] !== TRUE) {
+        $hash = hash('sha256', serialize($file));
+        $path = isset($map[$hash]) ? $map[$hash] : NULL;
+      }
+      // We recompile this file if recompile equals TRUE, array (and thereby the
+      // hash value) changed, if the file doesn't exist, or if we are in development
+      // mode. NOTE: You can use the 'recompile' array for your CSS files to cache
+      // them based on advanced criteria.
+      if ($devel || $file['recompile'] === TRUE || !isset($path) || !file_exists($path)) {
+        $syntax = drupal_substr($file['data'], -4);
+        if (!$output = sassy_parse($file['data'], $syntax, $style, $devel)) {
+          unset($elements['#items'][$key]);
+          continue;
+        }
+        $directory = 'public://sassy';
+        $path = $directory . '/' . drupal_hash_base64($output) . '.css';
+        // Create the CSS file.
+        file_prepare_directory($directory, FILE_CREATE_DIRECTORY);
+        if (!file_exists($path) && !file_unmanaged_save_data($output, $path, FILE_EXISTS_REPLACE)) {
+          unset($elements['#items'][$key]);
+          continue;
+        }
+      }
+      // Update the item in the stylesheets array.
+      $elements['#items'][$key] = $file;
+      $elements['#items'][$key]['data'] = $path;
+      if ($file['recompile'] !== TRUE) {
+        // Don't cache this item if it is set to recompile on every page load.
+        $map[$hash] = $path;
+      }
+    }
+  }
+  // If $map and $original don't match anymore that means we need to update the
+  // CSS cache.
+  if ($original !== $map) {
+    variable_set('sassy_cache', $map);
+  }
+  return $elements;
+}
+
+/**
+ * Deletes old cached SCSS files.
+ */
+function sassy_clear_cache() {
+  variable_del('sassy_cache');
+  file_scan_directory('public://sassy', '/.*/', array('callback' => 'drupal_delete_file_if_stale'));
+}
+
+/**
+ * Parse a SCSS string and transform it into CSS.
+ *
+ * @param $data
+ *   A SCSS string.
+ * @param $file
+ *   The SASS or SCSS file that $data belongs to described by an array.
+ * @param $syntax
+ *   The syntax (SASS or SCSS) of the file contents. This information is needed
+ *   by the parser.
+ *
+ * @return
+ *   The transformed CSS as a string.
+ */
+function sassy_parse($file, $syntax, $style = 'nested', $debug = FALSE) {
+  if (module_load_include('php', 'sassy', 'phpsass/SassParser')) {
+    try {
+      $options = array(
+        'style' => $style,
+        'cache' => FALSE,
+        'syntax' => $syntax,
+        'debug' => FALSE,
+        'debug_info' => $debug,
+        'load_path_functions' => array('sassy_load_callback'),
+        'functions' => sassy_get_functions(),
+      );
+      // Execute the compiler.
+      $parser = new SassParser($options);
+      return $parser->toCss($file);
+    }
+    catch (Exception $e) {
+      watchdog_exception('sassy', $e);
+      if (user_access('administer site configuration')) {
+        drupal_set_message(t('An error occured while processing !stylesheet. Please consult your !watchdog for a detailed error description.', array('!stylesheet' => l(basename($file), $file), '!watchdog' => l('log messages', 'admin/reports/dblog'))), 'error');
+      }
+    }
+  }
+}
+
+function sassy_get_functions() {
+  $functions =& drupal_static(__FUNCTION__);
+
+  if (!isset($function)) {
+    foreach (module_invoke_all('sassy_functions') as $name => $info) {
+      $info = (object) $info;
+      $functions[$info->name] = $info->callback;
+    }
+
+    foreach (array_merge($GLOBALS['base_theme_info'], array($GLOBALS['theme_info'])) as $info) {
+      $function = $info->info['name'] . '_sassy_functions';
+      if (function_exists($function) && $data = $function()) {
+        foreach ($data as $key => $item) {
+          $info = (object) $info;
+          $functions[$info->name] = $info->callback;
+        }
+      }
+    }
+  }
+
+  return $functions;
+}
+
+/**
+ * Called from inside SassParser when a file is trying to be loaded.
+ *
+ * @param $file
+ *    The file trying to be loaded, eg 'myfile/bla.scss'
+ *
+ * @return
+ *    An array of 0 - n filenames to load.
+ *    If no valid files are found return array() or FALSE
+ */
+function sassy_load_callback($file) {
+  $file = explode('/', $file, 2);
+  $namespace = preg_replace('/[^0-9a-z]+/i', '_', array_shift($file));
+  foreach (module_implements('sassy_resolve_path_' . $namespace) as $module) {
+    $hook = $module . '_sassy_resolve_path_' . $namespace;
+    if (function_exists($hook) && $paths = call_user_func($hook, $file[0])) {
+      return (array) $paths;
+    }
+  }
+  return FALSE;
+}
+
+/**
+ * Implementation of hook_sassy_resolve_path_NAMESPACE().
+ */
+function sassy_sassy_resolve_path_sassy($file) {
+  return sassy_registered_includes(basename($file));
+}
+
+/**
+ * Fetches, caches and returns all SASS / SCSS libraries from all enabled
+ * modules and the theme trail.
+ *
+ * @return
+ *   An array of all library files, sorted by their basename.
+ */
+function sassy_registered_includes($base = NULL) {
+  $includes = &drupal_static(__FUNCTION__);
+  if (!isset($includes)) {
+    if ($cache = cache_get('sassy_libraries:' . $GLOBALS['theme_key'])) {
+      $includes = $cache->data;
+    }
+    else {
+      $includes = array();
+      // Load libraries from all enabled modules and themes.
+      foreach (array_merge(module_list(), $GLOBALS['base_theme_info'], array($GLOBALS['theme_info'])) as $info) {
+        $type = is_object($info) ? 'theme' : 'module';
+        $name = $type == 'theme' ? $info->name : $info;
+        $info = $type == 'theme' ? $info->info : system_get_info('module', $name);
+        if (!empty($info['sassy'])) {
+          foreach ($info['sassy'] as $include) {
+            $path = drupal_get_path($type, $name) . '/' . $include;
+            if (is_file($path)) {
+              $includes[basename($path)][] = $path;
+            }
+          }
+        }
+      }
+      drupal_alter('sassy_includes', $includes);
+      cache_set('sassy_includes:' . $GLOBALS['theme_key'], $includes);
+    }
+  }
+  if (isset($base) && isset($includes[$base])) {
+    return $includes[$base];
+  }
+  else if (!isset($base)) {
+    return $includes;
+  }
+}
