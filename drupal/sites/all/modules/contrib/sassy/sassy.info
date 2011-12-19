@@ -1,0 +1,14 @@
+name = 'SASSY - SASS / SCSS Compiler'
+description = 'Integrates the PHamlP library into Drupal in order to use the SASS / SCSS Component.'
+core = '7.x'
+package = 'Theming Tools'
+version = 3.x
+
+configure = admin/config/media/sassy
+
+; Information added by drupal.org packaging script on 2011-12-12
+version = "7.x-2.0-rc7"
+core = "7.x"
+project = "sassy"
+datestamp = "1323655545"
+
