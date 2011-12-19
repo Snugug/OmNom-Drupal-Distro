@@ -1,0 +1,16 @@
+<?php
+
+/**
+ * @file
+ * Install, update and uninstall functions for the SASSY module.
+ */
+
+/**
+ * Implementation of hook_uninstall().
+ */
+function sassy_uninstall() {
+  variable_del('sassy_cache');
+  variable_del('sassy_devel');
+  // Delete the folder for the SCSS / SASS cache.
+  file_unmanaged_delete_recursive('public://sassy');
+}
